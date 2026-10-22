@@ -7,6 +7,7 @@ const MAX_PACKAGE_BYTES: usize = 32 * 1024;
 const MAX_PACKAGE_SECTORS: usize = MAX_PACKAGE_BYTES / 512;
 const CATALOG_MAGIC: &[u8; 8] = b"BLEUU001";
 const PACKAGE_NAME: &[u8; 5] = b"hello";
+const DESKTOP_MAGIC: &[u8; 8] = b"BLUDESK1";
 
 static STORAGE_ENABLED: AtomicBool = AtomicBool::new(false);
 
@@ -16,6 +17,32 @@ pub fn initialize() {
 
 pub fn storage_enabled() -> bool {
     STORAGE_ENABLED.load(Ordering::Acquire)
+}
+
+pub fn desktop_installed() -> bool {
+    if !storage_enabled() {
+        return false;
+    }
+    let mut sector = [0u8; 512];
+    crate::ata::read_sector(crate::system::DESKTOP_LBA, &mut sector)
+        && &sector[..8] == DESKTOP_MAGIC
+}
+
+pub fn install_desktop() -> bool {
+    if !storage_enabled() {
+        return false;
+    }
+    let mut sector = [0u8; 512];
+    sector[..8].copy_from_slice(DESKTOP_MAGIC);
+    sector[8..23].copy_from_slice(b"VBE-SOFTWARE-UI");
+    crate::ata::write_sector(crate::system::DESKTOP_LBA, &sector)
+}
+
+pub fn remove_desktop() -> bool {
+    if !desktop_installed() {
+        return false;
+    }
+    crate::ata::write_sector(crate::system::DESKTOP_LBA, &[0; 512])
 }
 
 pub fn execute(command: &[u8], mut write: impl FnMut(&[u8])) -> bool {
@@ -171,6 +198,12 @@ fn print_packages(write: &mut impl FnMut(&[u8])) {
     write(b"Available packages:\n  hello (embedded source ELF) - ");
     write(if package_installed() {
         b"installed on IDE disk\n"
+    } else {
+        b"not installed\n"
+    });
+    write(b"  desktop (built-in VBE desktop profile) - ");
+    write(if desktop_installed() {
+        b"installed\n"
     } else {
         b"not installed\n"
     });

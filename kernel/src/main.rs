@@ -4,6 +4,7 @@
 extern crate alloc;
 
 mod ata;
+mod auth;
 mod bleuu;
 mod fs;
 mod graphics;
@@ -12,6 +13,7 @@ mod keyboard;
 mod memory;
 mod mouse;
 mod serial;
+mod system;
 mod task;
 mod user;
 
@@ -370,26 +372,26 @@ pub extern "C" fn _start(boot_info: *const memory::BootInfo) -> ! {
             halt_forever();
         }
         let graphics_ready = graphics::initialize(&*boot_info);
-        graphics::refresh(core::ptr::addr_of!((*core::ptr::addr_of!(CONSOLE)).cells));
         let (screen_width, screen_height) = graphics::dimensions();
         let mouse_ready = mouse::initialize(screen_width, screen_height);
         enable_pic_irqs(mouse_ready);
         task::initialize();
         init_pit_timer();
         bleuu::initialize();
+        let auth_stage = auth::initialize();
         print_logo();
-        console_write(b"OpSYS 0.5 | x86_64 | Rust no_std | ring 3 + ELF\n");
+        console_write(b"OpSYS 0.6 | x86_64 | Rust no_std | terminal-first\n");
         if graphics_ready {
-            console_write(b"VBE framebuffer desktop UI: ");
+            console_write(b"VBE framebuffer available: ");
             console_write_u64(screen_width as u64);
             console_put_byte(b'x');
             console_write_u64(screen_height as u64);
-            console_write(b" | software graphics driver\n");
+            console_write(b" | optional software desktop\n");
         } else {
             console_write(b"VBE framebuffer unavailable; using VGA text mode.\n");
         }
         if mouse_ready {
-            console_write(b"PS/2 mouse IRQ12 ready | click BLEUU on the taskbar for status\n");
+            console_write(b"PS/2 mouse IRQ12 ready | desktop mouse support available\n");
         } else {
             console_write(b"PS/2 mouse unavailable; keyboard remains active.\n");
         }
@@ -398,8 +400,17 @@ pub extern "C" fn _start(boot_info: *const memory::BootInfo) -> ! {
         console_write(b" | free 4 KiB frames after heap: ");
         console_write_u64(memory::free_frame_count() as u64);
         console_write(b"\nPIT 100 Hz | keyboard IRQ1 | kernel tasks + user process slot\n");
-        console_write(b"COM1 serial | RAM files | IDE disk note store\n");
-        console_write(b"Type help for commands. Install the demo with 'bleuu install hello'.\n\n");
+        console_write(b"COM1 serial | SYSTEM and persistent HOME disk partitions\n");
+        match auth_stage {
+            auth::Stage::SetupUsername => {
+                console_write(b"First boot: create a user and root password.\n")
+            }
+            auth::Stage::LoginUsername => console_write(b"Account found. Log in to continue.\n"),
+            _ => console_write(b"Attach a blank IDE data disk to complete account setup.\n"),
+        }
+        console_write(
+            b"Desktop is optional: root can install it with 'bleuu install desktop'.\n\n",
+        );
         print_prompt();
     }
     loop {
@@ -666,7 +677,7 @@ fn handle_scancode(scancode: u8) {
                 if len < (*console).input.len() {
                     (*console).input[len] = byte;
                     (*console).input_len = len + 1;
-                    console_put_byte(byte);
+                    console_put_byte(if auth::hides_input() { b'*' } else { byte });
                 }
             }
         }
@@ -895,7 +906,7 @@ unsafe fn console_write(bytes: &[u8]) {
 }
 
 unsafe fn print_prompt() {
-    console_write(b"opsys> ");
+    console_write(auth::prompt());
 }
 
 unsafe fn run_command() {
@@ -904,26 +915,62 @@ unsafe fn run_command() {
     let mut command = [0u8; 80];
     for index in 0..len {
         command[index] = (*console).input[index];
+        (*console).input[index] = 0;
     }
     (*console).input_len = 0;
 
-    let command = &command[..len];
-    if command.is_empty() {
+    if len == 0 {
         return;
     }
+    if !auth::is_ready() {
+        let result = auth::submit(&command[..len]);
+        match result {
+            auth::Result::Continue => console_write(b"\n"),
+            auth::Result::Accepted => {
+                console_write(if auth::is_root() { b"\nRoot session active.\n" } else { b"\nLogin successful.\n" });
+                console_write(b"Type help for commands.\n");
+            }
+            auth::Result::SetupComplete => {
+                console_write(b"\nAccount created. You are logged in as root.\n");
+                console_write(b"Use 'logout' to test normal login; 'bleuu install desktop' enables the optional UI.\n");
+            }
+            auth::Result::Invalid => console_write(b"\nInvalid value. Usernames use letters, digits, _ or -; passwords need 8-63 characters.\n"),
+            auth::Result::Rejected => console_write(b"\nLogin or disk setup failed. Check the IDE data disk and try again.\n"),
+        }
+        // Remove the transient command copy containing a password from the stack.
+        command.fill(0);
+        return;
+    }
+    let command = &command[..len];
     if command == b"help" {
-        console_write(b"help, opfetch, about, version, uptime, ticks, mem, paging, tasks, ps\n");
-        console_write(b"keyboard, mouse, ui, alloc\n");
-        console_write(b"ls, cat <file>, write NOTE <text>, disk, alloc\n");
+        console_write(b"help, whoami, su, logout, opfetch, about, version, uptime, ticks, mem, paging, tasks, ps\n");
+        console_write(b"keyboard, mouse, ui, desktop, terminal, alloc\n");
+        console_write(b"ls, cat <file>, write NOTE <text>, disk, partitions\n");
         console_write(b"bleuu status|packages|install|remove|start|stop|restart ...\n");
         console_write(b"color <name>, clear, echo <text>, reboot, halt\n");
+    } else if command == b"whoami" {
+        if auth::is_root() {
+            console_write(b"root\n");
+        } else {
+            console_write(auth::username());
+            console_put_byte(b'\n');
+        }
+    } else if command == b"su" {
+        if auth::begin_root_login() {
+            console_write(b"\n");
+        } else {
+            console_write(b"\nAlready root or authentication is unavailable.\n");
+        }
+    } else if command == b"logout" {
+        auth::begin_login();
+        console_write(b"\nLogged out.\n");
     } else if command == b"opfetch" {
         print_opfetch();
     } else if command == b"about" {
         console_write(b"OpSYS is a tiny BIOS-booted x86_64 kernel written in Rust.\n");
         console_write(b"It uses paging, ring 3, syscalls, IDT exceptions and preemptive tasks.\n");
     } else if command == b"version" {
-        console_write(b"OpSYS 0.5.0 | x86_64 | Rust no_std\n");
+        console_write(b"OpSYS 0.6.0 | x86_64 | Rust no_std\n");
     } else if command == b"uptime" {
         let ticks = TIMER_TICKS;
         let seconds = ticks / 100;
@@ -968,8 +1015,21 @@ unsafe fn run_command() {
                 b"Redrew the VBE desktop. Click BLEUU on the taskbar for service status.\n",
             );
         } else {
-            console_write(b"VBE desktop is unavailable; this boot is using VGA text mode.\n");
+            console_write(b"Desktop is inactive. Run 'bleuu start desktop' after installing it.\n");
         }
+    } else if command == b"desktop" || command == b"bleuu start desktop" {
+        if !auth::is_root() {
+            console_write(b"Root access required. Run 'su' first.\n");
+        } else if !bleuu::desktop_installed() {
+            console_write(b"Desktop is not installed. Run 'bleuu install desktop'.\n");
+        } else if graphics::activate(core::ptr::addr_of!((*console).cells)) {
+            console_write(b"Started the built-in VBE desktop. Type 'terminal' to return.\n");
+        } else {
+            console_write(b"No usable VBE framebuffer is available.\n");
+        }
+    } else if command == b"terminal" || command == b"bleuu stop desktop" {
+        graphics::deactivate(core::ptr::addr_of!((*console).cells));
+        console_write(b"Returned to terminal mode.\n");
     } else if command == b"mem" {
         console_write(b"BIOS E820 entries: ");
         console_write_u64(memory::e820_entry_count() as u64);
@@ -1081,10 +1141,37 @@ unsafe fn run_command() {
             console_write(b" | LBA28 sectors: ");
             console_write_u64(info.sectors as u64);
             console_put_byte(b'\n');
-            console_write(b"NOTE uses sector 2048 in the attached data image.\n");
+            console_write(b"Persistent HOME partition begins at LBA 4096.\n");
         } else {
             console_write(b"No ATA disk detected.\n");
         }
+    } else if command == b"partitions" {
+        system::partitions(&mut |bytes| console_write(bytes), |value| {
+            console_write_u64(value as u64)
+        });
+    } else if command == b"bleuu install desktop" {
+        if !auth::is_root() {
+            console_write(b"Root access required. Run 'su' first.\n");
+        } else if bleuu::install_desktop() {
+            console_write(
+                b"Bleuu: desktop profile installed. Run 'bleuu start desktop' to launch it.\n",
+            );
+        } else {
+            console_write(b"Bleuu: could not save the desktop profile to SYSTEM.\n");
+        }
+    } else if command == b"bleuu remove desktop" {
+        if !auth::is_root() {
+            console_write(b"Root access required. Run 'su' first.\n");
+        } else if bleuu::remove_desktop() {
+            graphics::deactivate(core::ptr::addr_of!((*console).cells));
+            console_write(b"Bleuu: desktop profile removed. HOME files were left untouched.\n");
+        } else {
+            console_write(b"Bleuu: desktop profile is not installed.\n");
+        }
+    } else if (command.starts_with(b"bleuu install ") || command.starts_with(b"bleuu remove "))
+        && !auth::is_root()
+    {
+        console_write(b"Root access required. Run 'su' first.\n");
     } else if bleuu::execute(command, |bytes| console_write(bytes)) {
     } else if command == b"alloc" {
         let mut values = alloc::vec::Vec::new();

@@ -20,6 +20,7 @@ static mut RED_SHIFT: u32 = 16;
 static mut GREEN_SHIFT: u32 = 8;
 static mut BLUE_SHIFT: u32 = 0;
 static mut ACTIVE: bool = false;
+static mut DESKTOP_MODE: bool = false;
 static mut MOUSE_X: i32 = 0;
 static mut MOUSE_Y: i32 = 0;
 static mut CURSOR_DRAWN: bool = false;
@@ -88,13 +89,40 @@ pub unsafe fn initialize(info: &BootInfo) -> bool {
     MOUSE_X = (width / 2) as i32;
     MOUSE_Y = (height / 2) as i32;
     ACTIVE = true;
-    draw_desktop();
-    draw_mouse_cursor();
+    DESKTOP_MODE = false;
+    fill_rect(0, 0, WIDTH, HEIGHT, rgb(3, 7, 14));
     true
 }
 
+pub fn activate(cells: *const [[u16; 80]; 25]) -> bool {
+    unsafe {
+        if PIXELS.is_null() || WIDTH == 0 || HEIGHT == 0 {
+            return false;
+        }
+        ACTIVE = true;
+        DESKTOP_MODE = true;
+        draw_desktop();
+        CURSOR_DRAWN = false;
+        render_console_buffer(cells);
+        draw_mouse_cursor();
+        true
+    }
+}
+
+pub fn deactivate(cells: *const [[u16; 80]; 25]) {
+    unsafe {
+        if !ACTIVE {
+            return;
+        }
+        DESKTOP_MODE = false;
+        CURSOR_DRAWN = false;
+        fill_rect(0, 0, WIDTH, HEIGHT, rgb(3, 7, 14));
+        render_console_buffer(cells);
+    }
+}
+
 pub fn active() -> bool {
-    unsafe { ACTIVE }
+    unsafe { ACTIVE && DESKTOP_MODE }
 }
 
 pub fn dimensions() -> (u32, u32) {
@@ -104,7 +132,11 @@ pub fn dimensions() -> (u32, u32) {
 pub fn refresh(cells: *const [[u16; 80]; 25]) {
     unsafe {
         if ACTIVE {
-            draw_desktop();
+            if DESKTOP_MODE {
+                draw_desktop();
+            } else {
+                fill_rect(0, 0, WIDTH, HEIGHT, rgb(3, 7, 14));
+            }
             CURSOR_DRAWN = false;
             render_console_buffer(cells);
         }
@@ -120,7 +152,17 @@ pub fn render_console_cell(row: usize, column: usize, character: u8, attribute: 
         if redraw_cursor {
             toggle_mouse_cursor();
         }
-        draw_console_cell(row, column, character, attribute);
+        if DESKTOP_MODE {
+            draw_console_cell(row, column, character, attribute);
+        } else {
+            draw_terminal_character(
+                32 + column * TEXT_CELL_WIDTH,
+                48 + row * TEXT_CELL_HEIGHT,
+                character,
+                vga_color(attribute & 0x0f),
+                vga_color((attribute >> 4) & 0x0f),
+            );
+        }
         if redraw_cursor {
             draw_mouse_cursor();
         }
@@ -148,19 +190,36 @@ pub unsafe fn render_console_buffer(cells: *const [[u16; 80]; 25]) {
         if CURSOR_DRAWN {
             toggle_mouse_cursor();
         }
+        if !DESKTOP_MODE {
+            fill_rect(0, 0, WIDTH, HEIGHT, rgb(3, 7, 14));
+        }
         for row in 0..25 {
             for column in 0..80 {
                 let cell = cells.cast::<u16>().add(row * 80 + column).read_volatile();
-                draw_console_cell(row, column, cell as u8, (cell >> 8) as u8);
+                let character = cell as u8;
+                let attribute = (cell >> 8) as u8;
+                if DESKTOP_MODE {
+                    draw_console_cell(row, column, character, attribute);
+                } else {
+                    draw_terminal_character(
+                        32 + column * TEXT_CELL_WIDTH,
+                        48 + row * TEXT_CELL_HEIGHT,
+                        character,
+                        vga_color(attribute & 0x0f),
+                        vga_color((attribute >> 4) & 0x0f),
+                    );
+                }
             }
         }
-        draw_mouse_cursor();
+        if DESKTOP_MODE {
+            draw_mouse_cursor();
+        }
     }
 }
 
 pub fn mouse_moved(x: i32, y: i32, buttons: u8) -> UiAction {
     unsafe {
-        if !ACTIVE {
+        if !ACTIVE || !DESKTOP_MODE {
             return UiAction::None;
         }
         if CURSOR_DRAWN {

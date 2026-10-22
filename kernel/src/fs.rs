@@ -1,6 +1,7 @@
 use crate::ata;
 
-const NOTE_LBA: u32 = 2048;
+const NOTE_LBA: u32 = crate::system::HOME_START;
+const LEGACY_NOTE_LBA: u32 = 2048;
 const NOTE_MAGIC: &[u8; 8] = b"OPSYN001";
 static README: &[u8] = b"OpSYS RAM filesystem\nFiles: README.TXT, HELLO.ELF\nUse 'run HELLO.ELF' to launch a ring-3 program.\nUse 'write NOTE text' and 'cat NOTE' for persistent disk storage.\n";
 
@@ -28,11 +29,22 @@ pub fn executable(name: &[u8]) -> Option<&'static [u8]> {
 }
 
 pub fn read_note(buffer: &mut [u8; 512]) -> Option<&[u8]> {
-    if !crate::bleuu::storage_enabled()
-        || !ata::read_sector(NOTE_LBA, buffer)
-        || &buffer[..8] != NOTE_MAGIC
-    {
+    if !crate::bleuu::storage_enabled() || !ata::read_sector(NOTE_LBA, buffer) {
         return None;
+    }
+    if &buffer[..8] != NOTE_MAGIC {
+        // Move the old note record into the HOME partition only when its first
+        // sector is blank. The old record remains intact on disk.
+        let mut legacy = [0u8; 512];
+        if !ata::read_sector(LEGACY_NOTE_LBA, &mut legacy) || &legacy[..8] != NOTE_MAGIC {
+            return None;
+        }
+        if buffer.iter().all(|byte| *byte == 0) {
+            let _ = ata::write_sector(NOTE_LBA, &legacy);
+            *buffer = legacy;
+        } else {
+            return None;
+        }
     }
     let length = u16::from_le_bytes([buffer[8], buffer[9]]) as usize;
     if length > 502 {
