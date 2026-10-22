@@ -6,7 +6,7 @@ QEMU ?= qemu-system-x86_64
 IMAGE := build/opsys.img
 KERNEL := kernel/target/x86_64-unknown-none/release/opsys-kernel
 
-.PHONY: all run clean
+.PHONY: all run clean clean-data
 all: $(IMAGE) build/opsys-data.img
 
 build:
@@ -24,7 +24,7 @@ build/hello.o: user/hello.asm | build
 build/hello.elf: build/hello.o user/linker.ld
 	$(LD) -nostdlib -z max-page-size=0x1000 -T user/linker.ld -o $@ build/hello.o
 
-$(KERNEL): kernel/src/main.rs kernel/src/memory.rs kernel/src/heap.rs kernel/src/task.rs kernel/src/keyboard.rs kernel/src/mouse.rs kernel/src/graphics.rs kernel/src/serial.rs kernel/src/ata.rs kernel/src/fs.rs kernel/src/user.rs kernel/src/bleuu.rs kernel/Cargo.toml kernel/.cargo/config.toml linker.ld build/hello.elf
+$(KERNEL): kernel/src/main.rs kernel/src/auth.rs kernel/src/system.rs kernel/src/memory.rs kernel/src/heap.rs kernel/src/task.rs kernel/src/keyboard.rs kernel/src/mouse.rs kernel/src/graphics.rs kernel/src/serial.rs kernel/src/ata.rs kernel/src/fs.rs kernel/src/user.rs kernel/src/bleuu.rs kernel/Cargo.toml kernel/.cargo/config.toml linker.ld build/hello.elf
 	cd kernel && $(CARGO) build --release
 
 build/kernel.bin: $(KERNEL) | build
@@ -46,4 +46,10 @@ run: $(IMAGE) build/opsys-data.img
 	$(QEMU) -machine pc -display gtk -serial stdio -boot order=a -drive format=raw,file=$(IMAGE),if=floppy -drive file=build/opsys-data.img,if=ide,index=0,format=raw -no-reboot -no-shutdown
 
 clean:
-	rm -rf build kernel/target
+	rm -f build/stage1.bin build/stage2.bin build/hello.o build/hello.elf build/kernel.bin build/opsys.img
+	rm -rf kernel/target
+
+# Explicitly destructive: removes saved accounts, HOME files, and installed
+# Bleuu package state from the QEMU data disk.
+clean-data:
+	rm -f build/opsys-data.img
