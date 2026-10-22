@@ -1,0 +1,5 @@
+# Rust compiler output
+kernel/target/
+
+# Generated boot images and binaries
+build/*
