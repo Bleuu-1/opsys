@@ -30,6 +30,10 @@ static mut STAGE: Stage = Stage::DiskUnavailable;
 static mut USERNAME: [u8; USERNAME_MAX] = [0; USERNAME_MAX];
 static mut USERNAME_LEN: usize = 0;
 static mut ROOT_SESSION: bool = false;
+// A failed root-password attempt should return to the state from which root
+// authentication was requested: the login prompt for direct root login, or
+// the normal shell after `su`.
+static mut ROOT_RETURN_STAGE: Stage = Stage::LoginUsername;
 static mut PENDING_NAME: [u8; USERNAME_MAX] = [0; USERNAME_MAX];
 static mut PENDING_NAME_LEN: usize = 0;
 static mut PENDING_USER_SALT: [u8; 16] = [0; 16];
@@ -152,17 +156,28 @@ pub fn submit(line: &[u8]) -> Result {
                 if line.is_empty() || line.len() > USERNAME_MAX {
                     return Result::Invalid;
                 }
+                if is_root_name(line) {
+                    ROOT_RETURN_STAGE = Stage::LoginUsername;
+                    STAGE = Stage::RootPassword;
+                    return Result::Continue;
+                }
                 let mut sector = [0u8; 512];
                 if !crate::ata::read_sector(system::ACCOUNT_LBA, &mut sector)
                     || &sector[..8] != MAGIC
-                    || sector[8] as usize != line.len()
-                    || &sector[9..9 + line.len()] != line
+                {
+                    return Result::Rejected;
+                }
+                let stored_len = sector[8] as usize;
+                if stored_len == 0
+                    || stored_len > USERNAME_MAX
+                    || stored_len != line.len()
+                    || !ascii_case_eq(&sector[9..9 + stored_len], line)
                 {
                     return Result::Rejected;
                 }
                 USERNAME = [0; USERNAME_MAX];
-                USERNAME[..line.len()].copy_from_slice(line);
-                USERNAME_LEN = line.len();
+                USERNAME[..stored_len].copy_from_slice(&sector[9..9 + stored_len]);
+                USERNAME_LEN = stored_len;
                 STAGE = Stage::LoginPassword;
                 Result::Continue
             }
@@ -202,7 +217,7 @@ pub fn submit(line: &[u8]) -> Result {
                     STAGE = Stage::Ready;
                     Result::Accepted
                 } else {
-                    STAGE = Stage::Ready;
+                    STAGE = ROOT_RETURN_STAGE;
                     Result::Rejected
                 }
             }
@@ -223,6 +238,7 @@ pub fn begin_root_login() -> bool {
         if STAGE != Stage::Ready || ROOT_SESSION {
             return false;
         }
+        ROOT_RETURN_STAGE = Stage::Ready;
         STAGE = Stage::RootPassword;
         true
     }
@@ -231,9 +247,22 @@ pub fn begin_root_login() -> bool {
 fn valid_username(value: &[u8]) -> bool {
     !value.is_empty()
         && value.len() <= USERNAME_MAX
+        && !is_root_name(value)
         && value
             .iter()
             .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_' || *byte == b'-')
+}
+
+fn is_root_name(value: &[u8]) -> bool {
+    ascii_case_eq(value, b"root")
+}
+
+fn ascii_case_eq(left: &[u8], right: &[u8]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(a, b)| a.eq_ignore_ascii_case(b))
 }
 
 fn make_salt(password: &[u8], domain: u8) -> [u8; 16] {
