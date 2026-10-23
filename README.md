@@ -40,7 +40,9 @@ make run
 
 ## First login and shell commands
 
-At first boot, enter a username (letters, numbers, `_`, and `-`), then a user password and root password (8 to 63 characters). Password input is masked. Use `su` to enter the root session. Try:
+At first boot, enter a username (letters, numbers, `_`, and `-`; `root` is reserved), then a user password and root password (8 to 63 characters). Password input is masked. Usernames are case-insensitive at login. Enter `root` at the login prompt to authenticate with the root password, or use `su` from a user shell.
+
+The first account setup ends in a root session. After you log out and sign in as your user, use `su` before any Bleuu install/remove command. Try:
 
 ```text
 help
