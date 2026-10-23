@@ -934,8 +934,13 @@ unsafe fn run_command() {
                 console_write(b"\nAccount created. You are logged in as root.\n");
                 console_write(b"Use 'logout' to test normal login; 'bleuu install desktop' enables the optional UI.\n");
             }
-            auth::Result::Invalid => console_write(b"\nInvalid value. Usernames use letters, digits, _ or -; passwords need 8-63 characters.\n"),
-            auth::Result::Rejected => console_write(b"\nLogin or disk setup failed. Check the IDE data disk and try again.\n"),
+            auth::Result::Invalid => console_write(b"\nInvalid value. Use a non-root username with letters, digits, _ or -; passwords need 8-63 characters.\n"),
+            auth::Result::Rejected => match auth::stage() {
+                auth::Stage::LoginUsername => console_write(b"\nAccount or password not accepted. Usernames ignore letter case; enter your account name or root.\n"),
+                auth::Stage::DiskUnavailable => console_write(b"\nLogin failed: the IDE data disk or saved account could not be read.\n"),
+                auth::Stage::Ready => console_write(b"\nRoot password not accepted; returning to the shell.\n"),
+                _ => console_write(b"\nLogin or disk setup failed. Check the IDE data disk and try again.\n"),
+            },
         }
         // Remove the transient command copy containing a password from the stack.
         command.fill(0);
