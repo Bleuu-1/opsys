@@ -1,4 +1,6 @@
 use crate::memory::{self, BootInfo, PAGE_SIZE};
+use crate::visual;
+use crate::wm::{self, Placement, Rect};
 
 const FRAMEBUFFER_VIRTUAL_BASE: u64 = 0xffff_ffff_d000_0000;
 const PRESENT: u64 = 1;
@@ -6,8 +8,6 @@ const WRITABLE: u64 = 2;
 const PWT: u64 = 1 << 3;
 const PCD: u64 = 1 << 4;
 const MAX_FRAMEBUFFER_BYTES: usize = 16 * 1024 * 1024;
-const TEXT_X: usize = 48;
-const TEXT_Y: usize = 98;
 const TEXT_CELL_WIDTH: usize = 8;
 const TEXT_CELL_HEIGHT: usize = 16;
 
@@ -24,11 +24,14 @@ static mut DESKTOP_MODE: bool = false;
 static mut MOUSE_X: i32 = 0;
 static mut MOUSE_Y: i32 = 0;
 static mut CURSOR_DRAWN: bool = false;
-static mut LAST_BUTTONS: u8 = 0;
+static mut BOLD_FONT: bool = false;
+static mut CELL_WIDTH: usize = TEXT_CELL_WIDTH;
+static mut BACKGROUND: u8 = 0;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum UiAction {
     None,
+    Redraw,
     BleuuStatus,
 }
 
@@ -86,10 +89,13 @@ pub unsafe fn initialize(info: &BootInfo) -> bool {
     RED_SHIFT = (info.framebuffer_rgb_positions & 0xff).min(24);
     GREEN_SHIFT = ((info.framebuffer_rgb_positions >> 8) & 0xff).min(24);
     BLUE_SHIFT = ((info.framebuffer_rgb_positions >> 16) & 0xff).min(24);
+    CELL_WIDTH = if width < 960 { 6 } else { TEXT_CELL_WIDTH };
+    BACKGROUND = 0;
     MOUSE_X = (width / 2) as i32;
     MOUSE_Y = (height / 2) as i32;
     ACTIVE = true;
     DESKTOP_MODE = false;
+    wm::initialize();
     fill_rect(0, 0, WIDTH, HEIGHT, rgb(3, 7, 14));
     true
 }
@@ -99,6 +105,7 @@ pub fn activate(cells: *const [[u16; 80]; 25]) -> bool {
         if PIXELS.is_null() || WIDTH == 0 || HEIGHT == 0 {
             return false;
         }
+        wm::initialize();
         ACTIVE = true;
         DESKTOP_MODE = true;
         draw_desktop();
@@ -123,6 +130,30 @@ pub fn deactivate(cells: *const [[u16; 80]; 25]) {
 
 pub fn active() -> bool {
     unsafe { ACTIVE && DESKTOP_MODE }
+}
+
+pub fn bold_font() -> bool {
+    unsafe { BOLD_FONT }
+}
+
+pub fn set_bold_font(bold: bool) -> bool {
+    unsafe {
+        if PIXELS.is_null() {
+            return false;
+        }
+        BOLD_FONT = bold;
+        true
+    }
+}
+
+pub fn set_background(preset: u8) -> bool {
+    if preset >= 6 {
+        return false;
+    }
+    unsafe {
+        BACKGROUND = preset;
+    }
+    true
 }
 
 pub fn dimensions() -> (u32, u32) {
@@ -170,15 +201,19 @@ pub fn render_console_cell(row: usize, column: usize, character: u8, attribute: 
 }
 
 unsafe fn draw_console_cell(row: usize, column: usize, character: u8, attribute: u8) {
+    let Some(placement) = wm::layout(WIDTH, HEIGHT)[wm::TERMINAL] else {
+        return;
+    };
     let foreground = vga_color(attribute & 0x0f);
     let background = vga_color((attribute >> 4) & 0x0f);
-    draw_terminal_character(
-        TEXT_X + column * TEXT_CELL_WIDTH,
-        TEXT_Y + row * TEXT_CELL_HEIGHT,
-        character,
-        foreground,
-        background,
-    );
+    let x = placement.rect.x + 9 + column * CELL_WIDTH;
+    let y = placement.rect.y + 39 + row * TEXT_CELL_HEIGHT;
+    if x + CELL_WIDTH > placement.rect.x + placement.rect.width
+        || y + TEXT_CELL_HEIGHT > placement.rect.y + placement.rect.height
+    {
+        return;
+    }
+    draw_terminal_character(x, y, character, foreground, background);
 }
 
 /// Redraw a text console cell from the existing VGA text buffer.
@@ -217,7 +252,7 @@ pub unsafe fn render_console_buffer(cells: *const [[u16; 80]; 25]) {
     }
 }
 
-pub fn mouse_moved(x: i32, y: i32, buttons: u8) -> UiAction {
+pub fn mouse_moved(x: i32, y: i32, buttons: u8, cells: *const [[u16; 80]; 25]) -> UiAction {
     unsafe {
         if !ACTIVE || !DESKTOP_MODE {
             return UiAction::None;
@@ -227,69 +262,296 @@ pub fn mouse_moved(x: i32, y: i32, buttons: u8) -> UiAction {
         }
         MOUSE_X = x.clamp(0, WIDTH.saturating_sub(1) as i32);
         MOUSE_Y = y.clamp(0, HEIGHT.saturating_sub(1) as i32);
-        let clicked = buttons & 1 != 0 && LAST_BUTTONS & 1 == 0;
-        LAST_BUTTONS = buttons;
-        draw_mouse_cursor();
+        let action =
+            match wm::pointer_event(MOUSE_X as usize, MOUSE_Y as usize, buttons, WIDTH, HEIGHT) {
+                wm::Action::None => UiAction::None,
+                wm::Action::Redraw => UiAction::Redraw,
+                wm::Action::BleuuStatus => UiAction::BleuuStatus,
+            };
+        if action == UiAction::Redraw || action == UiAction::BleuuStatus {
+            draw_desktop();
+            render_console_buffer(cells);
+        } else {
+            draw_mouse_cursor();
+        }
+        action
+    }
+}
 
-        if clicked {
-            let taskbar_y = HEIGHT.saturating_sub(42);
-            if MOUSE_Y as usize >= taskbar_y + 5
-                && (MOUSE_Y as usize) < taskbar_y + 37
-                && (148..238).contains(&(MOUSE_X as usize))
-            {
-                return UiAction::BleuuStatus;
+/// Accept a bounded ARGB back buffer from the active Ring-3 panel process.
+/// Transparent pixels leave the desktop underneath unchanged. This is a small
+/// copy syscall rather than a shared framebuffer mapping, so user code never
+/// receives direct access to the hardware framebuffer.
+pub fn submit_user_bar(pixels: &[u32], width: usize, height: usize, x: u64, y: u64) -> bool {
+    unsafe {
+        if !active()
+            || width == 0
+            || width > 1920
+            || height == 0
+            || height > 64
+            || x > WIDTH as u64
+            || y > 128
+            || x.saturating_add(width as u64) > WIDTH as u64
+            || y.saturating_add(height as u64) > HEIGHT as u64
+            || pixels.len() != width.saturating_mul(height)
+        {
+            return false;
+        }
+        if CURSOR_DRAWN {
+            toggle_mouse_cursor();
+        }
+        for row in 0..height {
+            for column in 0..width {
+                let color = pixels[row * width + column];
+                if color >> 24 != 0 {
+                    set_pixel(x as usize + column, y as usize + row, color & 0x00ff_ffff);
+                }
             }
         }
-        UiAction::None
+        draw_mouse_cursor();
+        true
     }
 }
 
 unsafe fn draw_desktop() {
-    fill_rect(0, 0, WIDTH, HEIGHT, rgb(13, 22, 39));
-    // A restrained desktop background with a blue accent panel.
-    fill_rect(0, 40, WIDTH, HEIGHT.saturating_sub(82), rgb(17, 31, 53));
-    fill_rect(0, 40, 8, HEIGHT.saturating_sub(82), rgb(36, 117, 176));
-
-    fill_rect(0, 0, WIDTH, 38, rgb(8, 14, 26));
-    draw_text(14, 13, b"OPSYS DESKTOP", rgb(235, 245, 255));
-    draw_text(
-        WIDTH.saturating_sub(165),
+    let theme = visual::palette(BACKGROUND);
+    let last_row = HEIGHT.saturating_sub(1).max(1);
+    for row in 0..HEIGHT {
+        let amount = (row.saturating_mul(255) / last_row).min(255) as u8;
+        let color = visual::alpha_blend(theme.canvas_bottom, theme.canvas_top, amount);
+        fill_rect(0, row, WIDTH, 1, color);
+    }
+    draw_glass_rect(
+        18,
+        11,
+        WIDTH.saturating_sub(36),
+        38,
         13,
-        b"QEMU  X86_64",
-        rgb(145, 167, 190),
+        theme.title_glass,
+        214,
+    );
+    draw_text(34, 26, b"BLEUU / OPSYS", theme.text);
+    draw_text(166, 26, b"DESKTOP", theme.muted_text);
+    let workspace = wm::current_workspace();
+    draw_rounded_rect(WIDTH.saturating_sub(82), 16, 56, 27, 12, theme.glass);
+    draw_text(WIDTH.saturating_sub(70), 26, b"WS", theme.muted_text);
+    draw_text(
+        WIDTH.saturating_sub(43),
+        26,
+        &[b'1' + workspace],
+        theme.accent,
     );
 
-    let window_width = WIDTH.saturating_sub(80);
-    let window_height = HEIGHT.saturating_sub(122);
-    fill_rect(34, 51, window_width, window_height, rgb(4, 9, 18));
-    fill_rect(38, 55, window_width - 8, window_height - 8, rgb(3, 7, 14));
-    fill_rect(38, 55, window_width - 8, 30, rgb(29, 43, 64));
-    draw_text(
-        52,
+    let placements = wm::layout(WIDTH, HEIGHT);
+    for id in 0..wm::WINDOW_COUNT {
+        if let Some(placement) = placements[id] {
+            draw_window(placement, wm::is_focused(id));
+        }
+    }
+    if placements.iter().all(Option::is_none) {
+        draw_empty_workspace();
+    }
+
+    let taskbar_y = HEIGHT.saturating_sub(56);
+    draw_glass_rect(
+        12,
+        taskbar_y,
+        WIDTH.saturating_sub(24),
+        42,
+        14,
+        theme.taskbar_glass,
+        224,
+    );
+    draw_button(22, taskbar_y + 6, 44, 29, b"OP", theme.accent);
+    draw_button(
+        72,
+        taskbar_y + 6,
         66,
-        b"OPSYS TERMINAL  -  KEYBOARD SHELL",
-        rgb(220, 232, 245),
+        29,
+        b"TERM",
+        if wm::is_open(wm::TERMINAL) {
+            theme.title_glass
+        } else {
+            theme.glass
+        },
     );
-    fill_rect(window_width + 5, 64, 10, 10, rgb(231, 91, 91));
-    fill_rect(window_width + 20, 64, 10, 10, rgb(231, 181, 79));
-    fill_rect(window_width + 35, 64, 10, 10, rgb(79, 190, 135));
+    draw_button(
+        142,
+        taskbar_y + 6,
+        55,
+        29,
+        b"SYS",
+        if wm::is_open(wm::SYSTEM) {
+            theme.title_glass
+        } else {
+            theme.glass
+        },
+    );
+    draw_button(
+        202,
+        taskbar_y + 6,
+        65,
+        29,
+        b"BLEUU",
+        if wm::is_open(wm::BLEUU) {
+            theme.title_glass
+        } else {
+            theme.glass
+        },
+    );
+    draw_button(275, taskbar_y + 6, 66, 29, b"STATUS", theme.title_glass);
+    for index in 0..wm::WORKSPACE_COUNT {
+        let x = 354 + index as usize * 32;
+        draw_button(
+            x,
+            taskbar_y + 6,
+            28,
+            29,
+            &[b'1' + index],
+            if index == workspace {
+                theme.accent
+            } else {
+                theme.glass
+            },
+        );
+    }
+    draw_text(462, taskbar_y + 17, b"SUPER+J/K FOCUS", theme.muted_text);
+}
 
-    let taskbar_y = HEIGHT.saturating_sub(42);
-    fill_rect(0, taskbar_y, WIDTH, HEIGHT - taskbar_y, rgb(8, 14, 26));
-    draw_button(10, taskbar_y + 6, 54, 29, b"OP", rgb(38, 96, 151));
-    draw_button(72, taskbar_y + 6, 68, 29, b"SHELL", rgb(33, 48, 69));
-    draw_button(148, taskbar_y + 6, 88, 29, b"BLEUU", rgb(25, 91, 113));
+unsafe fn draw_window(placement: Placement, focused: bool) {
+    let rect = placement.rect;
+    if rect.width < 110 || rect.height < 90 {
+        return;
+    }
+    let theme = visual::palette(BACKGROUND);
+    let border = if focused {
+        theme.focused_border
+    } else {
+        theme.border
+    };
+    draw_rounded_rect(rect.x, rect.y, rect.width, rect.height, 17, border);
+    draw_glass_rect(
+        rect.x + 2,
+        rect.y + 2,
+        rect.width.saturating_sub(4),
+        rect.height.saturating_sub(4),
+        15,
+        theme.glass,
+        218,
+    );
+    draw_glass_rect(
+        rect.x + 4,
+        rect.y + 4,
+        rect.width.saturating_sub(8),
+        34,
+        12,
+        theme.title_glass,
+        226,
+    );
+    let title = match placement.id {
+        wm::TERMINAL => b"TERMINAL  /  OPSH" as &[u8],
+        wm::SYSTEM => b"SYSTEM MONITOR",
+        _ => b"BLEUU CONTROL",
+    };
+    draw_text(rect.x + 18, rect.y + 17, title, theme.text);
+    let controls_x = rect.x + rect.width.saturating_sub(52);
+    draw_rounded_rect(controls_x, rect.y + 16, 10, 10, 5, theme.accent_secondary);
+    draw_rounded_rect(controls_x + 21, rect.y + 16, 10, 10, 5, 0xf38ba8);
+
+    match placement.id {
+        wm::TERMINAL => {
+            draw_glass_rect(
+                rect.x + 3,
+                rect.y + 32,
+                rect.width.saturating_sub(6),
+                rect.height.saturating_sub(35),
+                13,
+                theme.surface,
+                192,
+            );
+        }
+        wm::SYSTEM => draw_system_panel(rect, theme),
+        wm::BLEUU => draw_bleuu_panel(rect, theme),
+        _ => {}
+    }
+}
+
+unsafe fn draw_system_panel(rect: Rect, theme: visual::Palette) {
+    let x = rect.x + 20;
+    let mut y = rect.y + 58;
+    draw_text(x, y, b"SYSTEM", theme.accent);
+    y += 30;
+    draw_text(x, y, b"x86_64  /  RUST NO_STD", theme.text);
+    y += 27;
+    draw_text(x, y, b"PIT TIMER   100 HZ", theme.muted_text);
+    y += 27;
+    draw_text(x, y, b"KEYBOARD    IRQ1", theme.muted_text);
+    y += 27;
+    draw_text(x, y, b"MOUSE       IRQ12", theme.muted_text);
+    y += 27;
+    draw_text(x, y, b"VBE SOFTWARE RENDERER", theme.muted_text);
+    y += 27;
+    draw_text(x, y, b"TILE WINDOWS / 3 WORKSPACES", theme.muted_text);
+}
+
+unsafe fn draw_bleuu_panel(rect: Rect, theme: visual::Palette) {
+    let x = rect.x + 20;
+    let y = rect.y + 58;
+    draw_text(x, y, b"BLEUU DESKTOP", theme.accent);
+    draw_text(x, y + 30, b"PACKAGE PROFILE: INSTALLED", theme.text);
+    draw_text(x, y + 57, b"SHELL / SYSTEM / SERVICES", theme.muted_text);
+    let button_y = y + 103;
+    let button_width = rect.width.saturating_sub(28).min(188);
+    draw_rounded_rect(x, button_y, button_width, 34, 11, theme.accent);
     draw_text(
-        252,
-        taskbar_y + 16,
-        b"CLICK BLEUU FOR SERVICE STATUS",
-        rgb(143, 165, 188),
+        x + 13,
+        button_y + 13,
+        b"VIEW SERVICE STATUS",
+        theme.canvas_top,
+    );
+    draw_text(
+        x,
+        button_y + 55,
+        b"SUPER+1..3  SWITCH WORKSPACE",
+        theme.muted_text,
+    );
+    draw_text(
+        x,
+        button_y + 81,
+        b"SUPER+SHIFT+1..3  MOVE WINDOW",
+        theme.muted_text,
+    );
+}
+
+unsafe fn draw_empty_workspace() {
+    let x = 34;
+    let y = 90;
+    let theme = visual::palette(BACKGROUND);
+    draw_glass_rect(x, y, WIDTH.saturating_sub(68), 166, 18, theme.glass, 224);
+    draw_text(x + 24, y + 30, b"EMPTY WORKSPACE", theme.accent);
+    draw_text(
+        x + 24,
+        y + 70,
+        b"Use the taskbar to open Terminal, System, or Bleuu.",
+        theme.text,
+    );
+    draw_text(
+        x + 24,
+        y + 98,
+        b"SUPER+1..3 switches workspaces.",
+        theme.muted_text,
     );
 }
 
 unsafe fn draw_button(x: usize, y: usize, width: usize, height: usize, label: &[u8], color: u32) {
-    fill_rect(x, y, width, height, color);
-    draw_text(x + 9, y + 11, label, rgb(235, 244, 252));
+    let theme = visual::palette(BACKGROUND);
+    draw_glass_rect(x, y, width, height, 10, color, 220);
+    let text_color = if color == theme.accent {
+        theme.canvas_top
+    } else {
+        theme.text
+    };
+    draw_text(x + 10, y + 11, label, text_color);
 }
 
 unsafe fn draw_terminal_character(
@@ -299,7 +561,12 @@ unsafe fn draw_terminal_character(
     foreground: u32,
     background: u32,
 ) {
-    fill_rect(x, y, TEXT_CELL_WIDTH, TEXT_CELL_HEIGHT, background);
+    let cell_width = if DESKTOP_MODE {
+        CELL_WIDTH
+    } else {
+        TEXT_CELL_WIDTH
+    };
+    fill_rect(x, y, cell_width, TEXT_CELL_HEIGHT, background);
     if character == 0xdb {
         fill_rect(x, y, TEXT_CELL_WIDTH, TEXT_CELL_HEIGHT, foreground);
         return;
@@ -315,7 +582,7 @@ unsafe fn draw_terminal_character(
     let glyph = glyph_rows(character);
     for (row, pattern) in glyph.iter().enumerate() {
         for column in 0..5 {
-            if pattern & (1 << (4 - column)) != 0 {
+            if glyph_pixel(*pattern, column, BOLD_FONT) {
                 fill_rect(x + column + 1, y + row * 2 + 1, 1, 2, foreground);
             }
         }
@@ -327,7 +594,7 @@ unsafe fn draw_text(x: usize, y: usize, text: &[u8], color: u32) {
         let glyph = glyph_rows(byte);
         for (row, pattern) in glyph.iter().enumerate() {
             for column in 0..5 {
-                if pattern & (1 << (4 - column)) != 0 {
+                if glyph_pixel(*pattern, column, BOLD_FONT) {
                     set_pixel(x + index * 7 + column, y + row, color);
                 }
             }
@@ -345,6 +612,64 @@ unsafe fn fill_rect(x: usize, y: usize, width: usize, height: usize, color: u32)
     }
 }
 
+/// Paint a rounded rectangle without touching pixels outside its corner mask.
+unsafe fn draw_rounded_rect(
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+    radius: usize,
+    color: u32,
+) {
+    let x_end = x.saturating_add(width).min(WIDTH);
+    let y_end = y.saturating_add(height).min(HEIGHT);
+    for row in y.min(HEIGHT)..y_end {
+        for column in x.min(WIDTH)..x_end {
+            if visual::inside_rounded_rect(column - x, row - y, width, height, radius) {
+                set_pixel(column, row, color);
+            }
+        }
+    }
+}
+
+/// Alpha-composite a tinted glass surface over the current framebuffer.
+/// A fine highlight on the top edge and sparse low-contrast grain suggest
+/// frosted material while keeping the implementation single-buffered.
+unsafe fn draw_glass_rect(
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+    radius: usize,
+    tint: u32,
+    opacity: u8,
+) {
+    let x_end = x.saturating_add(width).min(WIDTH);
+    let y_end = y.saturating_add(height).min(HEIGHT);
+    for row in y.min(HEIGHT)..y_end {
+        for column in x.min(WIDTH)..x_end {
+            if !visual::inside_rounded_rect(column - x, row - y, width, height, radius) {
+                continue;
+            }
+            let underlay = read_pixel_rgb(column, row);
+            let mut color = visual::alpha_blend(tint, underlay, opacity);
+            if row - y <= 1 {
+                color = visual::alpha_blend(0xc0caf5, color, 24);
+            } else if (column.wrapping_mul(13) ^ row.wrapping_mul(7)) & 63 == 0 {
+                color = visual::alpha_blend(0xdde4ff, color, 7);
+            }
+            set_pixel(column, row, color);
+        }
+    }
+}
+
+fn glyph_pixel(pattern: u8, column: usize, bold: bool) -> bool {
+    let shift = 4 - column;
+    let current = pattern & (1 << shift) != 0;
+    let previous = bold && pattern & (1 << (shift + 1)) != 0;
+    current || previous
+}
+
 unsafe fn set_pixel(x: usize, y: usize, color: u32) {
     if x < WIDTH && y < HEIGHT {
         let value = pack_rgb(color);
@@ -355,6 +680,21 @@ unsafe fn set_pixel(x: usize, y: usize, color: u32) {
                 .write_volatile((value >> (byte * 8)) as u8);
         }
     }
+}
+
+unsafe fn read_pixel_rgb(x: usize, y: usize) -> u32 {
+    if x >= WIDTH || y >= HEIGHT {
+        return 0;
+    }
+    let address = PIXELS.add(y * PITCH_BYTES + x * BYTES_PER_PIXEL);
+    let mut packed = 0u32;
+    for byte in 0..BYTES_PER_PIXEL {
+        packed |= (address.add(byte).read_volatile() as u32) << (byte * 8);
+    }
+    let red = (packed >> RED_SHIFT) & 0xff;
+    let green = (packed >> GREEN_SHIFT) & 0xff;
+    let blue = (packed >> BLUE_SHIFT) & 0xff;
+    (red << 16) | (green << 8) | blue
 }
 
 unsafe fn toggle_mouse_cursor() {

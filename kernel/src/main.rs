@@ -6,19 +6,36 @@ extern crate alloc;
 mod ata;
 mod auth;
 mod bleuu;
+mod diskfs;
 mod fs;
 mod graphics;
 mod heap;
 mod keyboard;
 mod memory;
 mod mouse;
+mod partition;
+mod security;
 mod serial;
+mod settings;
 mod system;
 mod task;
 mod user;
+mod vfs;
+mod visual;
+mod wm;
 
+use crate::vfs::FileSystem;
 use core::fmt::Write as FmtWrite;
 use core::panic::PanicInfo;
+
+fn version_text() -> &'static [u8] {
+    let bytes = include_bytes!("../../VERSION");
+    if bytes.last() == Some(&b'\n') {
+        &bytes[..bytes.len() - 1]
+    } else {
+        bytes
+    }
+}
 
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
@@ -73,6 +90,13 @@ struct Console {
     cells: [[u16; 80]; 25],
     input: [u8; 80],
     input_len: usize,
+    history: [[u8; 80]; 8],
+    history_lengths: [usize; 8],
+    history_count: usize,
+    history_next: usize,
+    history_position: usize,
+    history_draft: [u8; 80],
+    history_draft_len: usize,
     shift: bool,
     caps_lock: bool,
 }
@@ -84,11 +108,468 @@ static mut CONSOLE: Console = Console {
     cells: [[0x0f20; 80]; 25],
     input: [0; 80],
     input_len: 0,
+    history: [[0; 80]; 8],
+    history_lengths: [0; 8],
+    history_count: 0,
+    history_next: 0,
+    history_position: 0,
+    history_draft: [0; 80],
+    history_draft_len: 0,
     shift: false,
     caps_lock: false,
 };
 
 static mut TIMER_TICKS: u64 = 0;
+static mut SUPER_DOWN: bool = false;
+static mut EXTENDED_PREFIX: bool = false;
+
+const HISTORY_CAPACITY: usize = 8;
+
+struct CompletionEntries {
+    entries: [[u8; 80]; 16],
+    lengths: [usize; 16],
+    directories: [bool; 16],
+    count: usize,
+    line: [u8; 80],
+    line_len: usize,
+}
+
+impl CompletionEntries {
+    const fn new() -> Self {
+        Self {
+            entries: [[0; 80]; 16],
+            lengths: [0; 16],
+            directories: [false; 16],
+            count: 0,
+            line: [0; 80],
+            line_len: 0,
+        }
+    }
+
+    fn feed(&mut self, bytes: &[u8]) {
+        for byte in bytes.iter().copied() {
+            if byte == b'\n' {
+                self.finish_line();
+            } else if self.line_len < self.line.len() {
+                self.line[self.line_len] = byte;
+                self.line_len += 1;
+            }
+        }
+    }
+
+    fn finish_line(&mut self) {
+        let raw = &self.line[..self.line_len];
+        let name_len = raw
+            .iter()
+            .position(|byte| *byte == b' ')
+            .unwrap_or(raw.len());
+        let directory = name_len > 0 && raw[name_len - 1] == b'/';
+        let name_len = if directory { name_len - 1 } else { name_len };
+        if name_len > 0 && self.count < self.entries.len() {
+            let slot = self.count;
+            self.entries[slot][..name_len].copy_from_slice(&raw[..name_len]);
+            self.lengths[slot] = name_len;
+            self.directories[slot] = directory;
+            self.count += 1;
+        }
+        self.line.fill(0);
+        self.line_len = 0;
+    }
+}
+
+const COMMAND_COMPLETIONS: &[&[u8]] = &[
+    b"about",
+    b"alloc",
+    b"bleuu install desktop",
+    b"bleuu install hello",
+    b"bleuu packages",
+    b"bleuu remove desktop",
+    b"bleuu remove hello",
+    b"bleuu restart desktop",
+    b"bleuu restart hello",
+    b"bleuu start desktop",
+    b"bleuu start hello",
+    b"bleuu start bleuubar",
+    b"bleuu status",
+    b"bleuu stop desktop",
+    b"bleuu stop hello",
+    b"bleuu stop bleuubar",
+    b"cat ",
+    b"clear",
+    b"color ",
+    b"config",
+    b"config lua",
+    b"config reset",
+    b"config set background ",
+    b"config set color ",
+    b"config set font bold",
+    b"config set font regular",
+    b"desktop",
+    b"disk",
+    b"echo ",
+    b"font",
+    b"halt",
+    b"help",
+    b"id",
+    b"keyboard",
+    b"logout",
+    b"ls ",
+    b"mem",
+    b"mkdir ",
+    b"mouse",
+    b"opfetch",
+    b"paging",
+    b"partitions",
+    b"ps",
+    b"reboot",
+    b"su",
+    b"tasks",
+    b"terminal",
+    b"ticks",
+    b"touch ",
+    b"ui",
+    b"uptime",
+    b"version",
+    b"whoami",
+    b"window terminal",
+    b"write ",
+    b"wm",
+    b"history",
+];
+
+const COLOR_COMPLETIONS: &[&[u8]] = &[
+    b"color white",
+    b"color gray",
+    b"color red",
+    b"color green",
+    b"color yellow",
+    b"color blue",
+    b"color magenta",
+    b"color cyan",
+    b"color default",
+];
+const COLOR_SETTING_COMPLETIONS: &[&[u8]] = &[
+    b"config set color white",
+    b"config set color gray",
+    b"config set color red",
+    b"config set color green",
+    b"config set color yellow",
+    b"config set color blue",
+    b"config set color magenta",
+    b"config set color cyan",
+    b"config set color default",
+];
+const BACKGROUND_COMPLETIONS: &[&[u8]] = &[
+    b"config set background midnight",
+    b"config set background ocean",
+    b"config set background forest",
+    b"config set background sunset",
+    b"config set background slate",
+    b"config set background ember",
+];
+
+unsafe fn reset_history_navigation() {
+    let console = core::ptr::addr_of_mut!(CONSOLE);
+    (*console).history_position = 0;
+    (*console).history_draft.fill(0);
+    (*console).history_draft_len = 0;
+}
+
+unsafe fn clear_history() {
+    let console = core::ptr::addr_of_mut!(CONSOLE);
+    (*console).history.fill([0; 80]);
+    (*console).history_lengths.fill(0);
+    (*console).history_count = 0;
+    (*console).history_next = 0;
+    reset_history_navigation();
+}
+
+unsafe fn save_history(command: &[u8]) {
+    if command.is_empty() || command.len() > 80 {
+        return;
+    }
+    let console = core::ptr::addr_of_mut!(CONSOLE);
+    let previous = ((*console).history_next + HISTORY_CAPACITY - 1) % HISTORY_CAPACITY;
+    if (*console).history_count > 0
+        && (*console).history_lengths[previous] == command.len()
+        && (&(*console).history[previous])[..command.len()].eq(command)
+    {
+        reset_history_navigation();
+        return;
+    }
+    let slot = (*console).history_next;
+    (*console).history[slot].fill(0);
+    (&mut (*console).history[slot])[..command.len()].copy_from_slice(command);
+    (*console).history_lengths[slot] = command.len();
+    (*console).history_next = (slot + 1) % HISTORY_CAPACITY;
+    (*console).history_count = ((*console).history_count + 1).min(HISTORY_CAPACITY);
+    reset_history_navigation();
+}
+
+unsafe fn replace_input(bytes: &[u8]) {
+    let console = core::ptr::addr_of_mut!(CONSOLE);
+    let old_len = (*console).input_len;
+    for _ in 0..old_len {
+        console_put_byte(8);
+    }
+    (*console).input.fill(0);
+    (*console).input_len = bytes.len().min((*console).input.len());
+    (&mut (*console).input)[..(*console).input_len].copy_from_slice(&bytes[..(*console).input_len]);
+    for byte in (&(*console).input)[..(*console).input_len].iter().copied() {
+        console_put_byte(if auth::hides_input() { b'*' } else { byte });
+    }
+}
+
+unsafe fn navigate_history(older: bool) {
+    if !auth::is_ready()
+        || auth::hides_input()
+        || SUPER_DOWN
+        || (graphics::active() && wm::focused() != wm::TERMINAL)
+    {
+        return;
+    }
+    let console = core::ptr::addr_of_mut!(CONSOLE);
+    if (*console).history_count == 0 {
+        return;
+    }
+    if older {
+        if (*console).history_position == 0 {
+            (*console).history_draft.fill(0);
+            (*console).history_draft_len = (*console).input_len;
+            (&mut (*console).history_draft)[..(*console).input_len]
+                .copy_from_slice(&(&(*console).input)[..(*console).input_len]);
+        }
+        if (*console).history_position < (*console).history_count {
+            (*console).history_position += 1;
+        }
+        let slot = ((*console).history_next + HISTORY_CAPACITY - (*console).history_position)
+            % HISTORY_CAPACITY;
+        let length = (*console).history_lengths[slot];
+        let mut recalled = [0u8; 80];
+        recalled[..length].copy_from_slice(&(&(*console).history[slot])[..length]);
+        replace_input(&recalled[..length]);
+    } else if (*console).history_position > 0 {
+        (*console).history_position -= 1;
+        if (*console).history_position == 0 {
+            let length = (*console).history_draft_len;
+            let mut draft = [0u8; 80];
+            draft[..length].copy_from_slice(&(&(*console).history_draft)[..length]);
+            replace_input(&draft[..length]);
+            (*console).history_draft.fill(0);
+            (*console).history_draft_len = 0;
+        } else {
+            let slot = ((*console).history_next + HISTORY_CAPACITY - (*console).history_position)
+                % HISTORY_CAPACITY;
+            let length = (*console).history_lengths[slot];
+            let mut recalled = [0u8; 80];
+            recalled[..length].copy_from_slice(&(&(*console).history[slot])[..length]);
+            replace_input(&recalled[..length]);
+        }
+    }
+}
+
+unsafe fn apply_completion_candidates(candidates: &[&[u8]], typed: &[u8]) {
+    let mut first: Option<&[u8]> = None;
+    let mut common_len = 0usize;
+    let mut matches = 0usize;
+    for candidate in candidates.iter().copied() {
+        if candidate.len() < typed.len() || !candidate[..typed.len()].eq_ignore_ascii_case(typed) {
+            continue;
+        }
+        matches += 1;
+        if let Some(initial) = first {
+            common_len = common_len.min(candidate.len());
+            for index in 0..common_len {
+                if !candidate[index].eq_ignore_ascii_case(&initial[index]) {
+                    common_len = index;
+                    break;
+                }
+            }
+        } else {
+            first = Some(candidate);
+            common_len = candidate.len();
+        }
+    }
+    let Some(first) = first else { return };
+    if matches == 1 {
+        let suffix = &first[typed.len()..];
+        append_input(suffix);
+    } else if common_len > typed.len() {
+        append_input(&first[typed.len()..common_len]);
+    } else {
+        console_put_byte(b'\n');
+        let mut written = 0usize;
+        for candidate in candidates.iter().copied() {
+            if candidate.len() >= typed.len()
+                && candidate[..typed.len()].eq_ignore_ascii_case(typed)
+            {
+                if written != 0 {
+                    console_write(b"  ");
+                }
+                console_write(candidate);
+                written += 1;
+            }
+        }
+        console_put_byte(b'\n');
+        print_prompt();
+        let console = core::ptr::addr_of!(CONSOLE);
+        for byte in (&(*console).input)[..(*console).input_len].iter().copied() {
+            console_put_byte(byte);
+        }
+    }
+}
+
+unsafe fn append_input(bytes: &[u8]) {
+    let console = core::ptr::addr_of_mut!(CONSOLE);
+    for byte in bytes.iter().copied() {
+        let length = (*console).input_len;
+        if length == (*console).input.len() {
+            break;
+        }
+        (*console).input[length] = byte;
+        (*console).input_len = length + 1;
+        console_put_byte(byte);
+    }
+}
+
+unsafe fn print_history() {
+    let console = core::ptr::addr_of!(CONSOLE);
+    let count = (*console).history_count;
+    let oldest = ((*console).history_next + HISTORY_CAPACITY - count) % HISTORY_CAPACITY;
+    for position in 0..count {
+        let slot = (oldest + position) % HISTORY_CAPACITY;
+        console_write_u64((position + 1) as u64);
+        console_write(b"  ");
+        console_write(&(&(*console).history[slot])[..(*console).history_lengths[slot]]);
+        console_put_byte(b'\n');
+    }
+}
+
+unsafe fn complete_file_path(input: &[u8]) -> bool {
+    let argument_start = if input.starts_with(b"cat ") {
+        4
+    } else if input.starts_with(b"ls ") {
+        3
+    } else if input.starts_with(b"touch ") {
+        6
+    } else if input.starts_with(b"mkdir ") {
+        6
+    } else if input.starts_with(b"write ") {
+        6
+    } else {
+        return false;
+    };
+    let argument = &input[argument_start..];
+    let path_len = argument
+        .iter()
+        .position(|byte| *byte == b' ')
+        .unwrap_or(argument.len());
+    if path_len < argument.len() {
+        return true;
+    }
+    let path = &argument[..path_len];
+    let slash = path.iter().rposition(|byte| *byte == b'/');
+    let (directory, base, typed_length) = match slash {
+        Some(index) => (
+            &path[..index],
+            &path[index + 1..],
+            argument_start + index + 1,
+        ),
+        None => (&[][..], path, argument_start),
+    };
+    let query = if directory.is_empty() {
+        b"/".as_slice()
+    } else {
+        directory
+    };
+    let mut entries = CompletionEntries::new();
+    let _ = vfs::VFS.list(query, &mut |fragment| entries.feed(fragment));
+
+    let mut matches = 0usize;
+    let mut first = 0usize;
+    let mut common_len = 0usize;
+    for index in 0..entries.count {
+        let candidate = &entries.entries[index][..entries.lengths[index]];
+        if candidate.len() < base.len() || !candidate[..base.len()].eq_ignore_ascii_case(base) {
+            continue;
+        }
+        matches += 1;
+        if matches == 1 {
+            first = index;
+            common_len = candidate.len();
+        } else {
+            let previous = &entries.entries[first][..entries.lengths[first]];
+            common_len = common_len.min(candidate.len());
+            for offset in 0..common_len {
+                if !candidate[offset].eq_ignore_ascii_case(&previous[offset]) {
+                    common_len = offset;
+                    break;
+                }
+            }
+        }
+    }
+    if matches == 0 {
+        return true;
+    }
+    if matches == 1 {
+        let candidate = &entries.entries[first][..entries.lengths[first]];
+        let mut suffix = [0u8; 80];
+        let mut suffix_len = candidate.len().saturating_sub(base.len());
+        suffix[..suffix_len].copy_from_slice(&candidate[base.len()..]);
+        if entries.directories[first] && (suffix_len == 0 || suffix[suffix_len - 1] != b'/') {
+            suffix[suffix_len] = b'/';
+            suffix_len += 1;
+        }
+        append_input(&suffix[..suffix_len]);
+    } else if common_len > base.len() {
+        let candidate = &entries.entries[first][..entries.lengths[first]];
+        append_input(&candidate[base.len()..common_len]);
+    } else {
+        console_put_byte(b'\n');
+        for index in 0..entries.count {
+            let candidate = &entries.entries[index][..entries.lengths[index]];
+            if candidate.len() >= base.len() && candidate[..base.len()].eq_ignore_ascii_case(base) {
+                if typed_length > argument_start {
+                    console_write(&input[argument_start..typed_length]);
+                }
+                console_write(candidate);
+                if entries.directories[index] {
+                    console_put_byte(b'/');
+                }
+                console_write(b"  ");
+            }
+        }
+        console_put_byte(b'\n');
+        print_prompt();
+        for byte in input {
+            console_put_byte(*byte);
+        }
+    }
+    true
+}
+
+unsafe fn complete_input() {
+    if !auth::is_ready() || auth::hides_input() {
+        return;
+    }
+    let console = core::ptr::addr_of!(CONSOLE);
+    let mut input = [0u8; 80];
+    let length = (*console).input_len;
+    input[..length].copy_from_slice(&(&(*console).input)[..length]);
+    let line = &input[..length];
+
+    if line.starts_with(b"config set background ") {
+        apply_completion_candidates(BACKGROUND_COMPLETIONS, line);
+    } else if line.starts_with(b"config set color ") {
+        apply_completion_candidates(COLOR_SETTING_COMPLETIONS, line);
+    } else if line.starts_with(b"color ") {
+        apply_completion_candidates(COLOR_COMPLETIONS, line);
+    } else if complete_file_path(line) {
+        // File-name completion owns the argument once a file command is entered.
+    } else {
+        apply_completion_candidates(COMMAND_COMPLETIONS, line);
+    }
+}
 
 #[repr(C, align(16))]
 struct TaskStateSegment {
@@ -380,7 +861,9 @@ pub extern "C" fn _start(boot_info: *const memory::BootInfo) -> ! {
         bleuu::initialize();
         let auth_stage = auth::initialize();
         print_logo();
-        console_write(b"OpSYS 0.6 | x86_64 | Rust no_std | terminal-first\n");
+        console_write(b"OpSYS ");
+        console_write(version_text());
+        console_write(b" | x86_64 | Rust no_std | terminal-first\n");
         if graphics_ready {
             console_write(b"VBE framebuffer available: ");
             console_write_u64(screen_width as u64);
@@ -603,6 +1086,103 @@ unsafe fn handle_syscall(frame: *mut u64) -> *mut u64 {
             frame
         }
         2 => task::exit_current(frame),
+        3 => {
+            let address = frame.add(9).read();
+            let width = frame.add(10).read();
+            let height = frame.add(11).read();
+            let x = frame.add(12).read();
+            let y = frame.add(7).read();
+            let pixel_count = width
+                .checked_mul(height)
+                .and_then(|count| usize::try_from(count).ok());
+            let result = match pixel_count {
+                Some(count)
+                    if count > 0
+                        && width > 0
+                        && height > 0
+                        && width <= 1920
+                        && height <= 64
+                        && address % core::mem::align_of::<u32>() as u64 == 0
+                        && memory::user_range_mapped(
+                            task::current_address_space(),
+                            address,
+                            count.saturating_mul(core::mem::size_of::<u32>()),
+                        ) =>
+                {
+                    let pixels = core::slice::from_raw_parts(address as *const u32, count);
+                    graphics::submit_user_bar(pixels, width as usize, height as usize, x, y)
+                }
+                _ => false,
+            };
+            frame.add(14).write(if result { 0 } else { u64::MAX });
+            frame
+        }
+        4 => {
+            let address = frame.add(9).read();
+            let length = core::mem::size_of::<user::SystemInfo>();
+            if memory::user_range_mapped(task::current_address_space(), address, length) {
+                let (framebuffer_width, framebuffer_height) = graphics::dimensions();
+                let info = user::SystemInfo {
+                    ticks: TIMER_TICKS,
+                    free_frames: memory::free_frame_count() as u64,
+                    framebuffer_width,
+                    framebuffer_height,
+                    uid: auth::uid(),
+                    workspace: wm::current_workspace() as u32,
+                    desktop_active: graphics::active() as u32,
+                    reserved: 0,
+                };
+                core::ptr::copy_nonoverlapping(
+                    &info as *const user::SystemInfo as *const u8,
+                    address as *mut u8,
+                    length,
+                );
+                frame.add(14).write(0);
+            } else {
+                frame.add(14).write(u64::MAX);
+            }
+            frame
+        }
+        5 => {
+            let path_address = frame.add(9).read();
+            let path_length = frame.add(10).read() as usize;
+            let output_address = frame.add(11).read();
+            let output_capacity = frame.add(12).read() as usize;
+            let root = task::current_address_space();
+            if path_length > 0
+                && path_length <= 96
+                && output_capacity > 0
+                && output_capacity <= diskfs::MAX_FILE_SIZE
+                && memory::user_range_mapped(root, path_address, path_length)
+                && memory::user_range_mapped(root, output_address, output_capacity)
+            {
+                let mut path = [0u8; 96];
+                core::ptr::copy_nonoverlapping(
+                    path_address as *const u8,
+                    path.as_mut_ptr(),
+                    path_length,
+                );
+                let mut contents = [0u8; diskfs::MAX_FILE_SIZE];
+                core::arch::asm!("sti", options(nomem, nostack));
+                let read_result =
+                    vfs::VFS.read_file(&path[..path_length], &mut contents[..output_capacity]);
+                core::arch::asm!("cli", options(nomem, nostack));
+                match read_result {
+                    Ok(length) => {
+                        core::ptr::copy_nonoverlapping(
+                            contents.as_ptr(),
+                            output_address as *mut u8,
+                            length,
+                        );
+                        frame.add(14).write(length as u64);
+                    }
+                    Err(_) => frame.add(14).write(u64::MAX),
+                }
+            } else {
+                frame.add(14).write(u64::MAX);
+            }
+            frame
+        }
         _ => {
             frame.add(14).write(u64::MAX);
             frame
@@ -612,6 +1192,28 @@ unsafe fn handle_syscall(frame: *mut u64) -> *mut u64 {
 
 fn handle_scancode(scancode: u8) {
     let console = core::ptr::addr_of_mut!(CONSOLE);
+
+    if scancode == 0xe0 {
+        unsafe {
+            EXTENDED_PREFIX = true;
+        }
+        return;
+    }
+    let extended = unsafe {
+        let value = EXTENDED_PREFIX;
+        EXTENDED_PREFIX = false;
+        value
+    };
+    if extended {
+        match scancode {
+            0x5b | 0x5c => unsafe { SUPER_DOWN = true },
+            0xdb | 0xdc => unsafe { SUPER_DOWN = false },
+            0x48 => unsafe { navigate_history(true) },
+            0x50 => unsafe { navigate_history(false) },
+            _ => {}
+        }
+        return;
+    }
 
     // Shift has separate make and break codes; Caps Lock toggles on make.
     match scancode {
@@ -636,6 +1238,19 @@ fn handle_scancode(scancode: u8) {
         _ => {}
     }
 
+    let super_down = unsafe { SUPER_DOWN };
+    let shift_down = unsafe { (*console).shift };
+    if graphics::active() && wm::handle_key(scancode, super_down, shift_down) {
+        unsafe { graphics::refresh(core::ptr::addr_of!((*console).cells)) };
+        return;
+    }
+    if super_down || (graphics::active() && !wm::focused_window_visible()) {
+        return;
+    }
+    if graphics::active() && wm::focused() != wm::TERMINAL {
+        return;
+    }
+
     // Ignore all other key-release codes.
     if scancode & 0x80 != 0 {
         return;
@@ -647,10 +1262,15 @@ fn handle_scancode(scancode: u8) {
             run_command();
             print_prompt();
         },
+        0x0f => unsafe {
+            complete_input();
+        },
         0x0e => unsafe {
             let len = (*console).input_len;
             if len > 0 {
+                reset_history_navigation();
                 (*console).input_len = len - 1;
+                (*console).input[len - 1] = 0;
                 console_put_byte(8);
             }
         },
@@ -675,6 +1295,7 @@ fn handle_scancode(scancode: u8) {
             unsafe {
                 let len = (*console).input_len;
                 if len < (*console).input.len() {
+                    reset_history_navigation();
                     (*console).input[len] = byte;
                     (*console).input_len = len + 1;
                     console_put_byte(if auth::hides_input() { b'*' } else { byte });
@@ -685,9 +1306,12 @@ fn handle_scancode(scancode: u8) {
 }
 
 fn handle_mouse_event(event: mouse::MouseState) {
-    if graphics::mouse_moved(event.x, event.y, event.buttons) == graphics::UiAction::BleuuStatus {
+    let console = core::ptr::addr_of_mut!(CONSOLE);
+    let cells = unsafe { core::ptr::addr_of!((*console).cells) };
+    let action = graphics::mouse_moved(event.x, event.y, event.buttons, cells);
+    if action == graphics::UiAction::BleuuStatus {
         unsafe {
-            (*core::ptr::addr_of_mut!(CONSOLE)).input_len = 0;
+            (*console).input_len = 0;
             console_write(b"\n[Desktop] Bleuu service status\n");
             let _ = bleuu::execute(b"bleuu status", |bytes| console_write(bytes));
             print_prompt();
@@ -918,6 +1542,7 @@ unsafe fn run_command() {
         (*console).input[index] = 0;
     }
     (*console).input_len = 0;
+    reset_history_navigation();
 
     if len == 0 {
         return;
@@ -927,10 +1552,12 @@ unsafe fn run_command() {
         match result {
             auth::Result::Continue => console_write(b"\n"),
             auth::Result::Accepted => {
+                apply_session_preferences();
                 console_write(if auth::is_root() { b"\nRoot session active.\n" } else { b"\nLogin successful.\n" });
                 console_write(b"Type help for commands.\n");
             }
             auth::Result::SetupComplete => {
+                apply_session_preferences();
                 console_write(b"\nAccount created. You are logged in as root.\n");
                 console_write(b"Use 'logout' to test normal login; 'bleuu install desktop' enables the optional UI.\n");
             }
@@ -946,19 +1573,45 @@ unsafe fn run_command() {
         command.fill(0);
         return;
     }
+    save_history(&command[..len]);
     let command = &command[..len];
+    let credentials = security::Credentials::current_session();
+    if !security::authorize(command, credentials) {
+        console_write(b"Permission denied. Run 'su' and enter the root password.\n");
+        return;
+    }
     if command == b"help" {
-        console_write(b"help, whoami, su, logout, opfetch, about, version, uptime, ticks, mem, paging, tasks, ps\n");
-        console_write(b"keyboard, mouse, ui, desktop, terminal, alloc\n");
-        console_write(b"ls, cat <file>, write NOTE <text>, disk, partitions\n");
+        console_write(b"help, history, whoami, id, su, logout, opfetch, about, version, uptime, ticks, mem, paging, tasks, ps\n");
+        console_write(b"keyboard, mouse, ui, wm, desktop, terminal, alloc\n");
+        console_write(b"font [regular|bold] - choose the framebuffer console font\n");
+        console_write(
+            b"config [show|lua|set color|set font|set background|reset] - saved per UID\n",
+        );
+        console_write(b"ls [dir], cat <file>, write <file> <text>, touch <file>, mkdir <dir>\n");
+        console_write(b"disk, partitions, and persistent HOME files (max 2 KiB each)\n");
         console_write(b"bleuu status|packages|install|remove|start|stop|restart ...\n");
+        console_write(b"bleuu start bleuubar launches the per-user Ring-3 bar.\n");
+        console_write(b"Package, service, halt, and reboot actions require root via 'su'.\n");
         console_write(b"color <name>, clear, echo <text>, reboot, halt\n");
+        console_write(
+            b"Up/Down recalls the last 8 commands; Tab completes commands and HOME paths.\n",
+        );
+    } else if command == b"history" {
+        print_history();
     } else if command == b"whoami" {
         if auth::is_root() {
             console_write(b"root\n");
         } else {
             console_write(auth::username());
             console_put_byte(b'\n');
+        }
+    } else if command == b"id" {
+        console_write(b"uid=");
+        console_write_u64(auth::uid() as u64);
+        console_write(if auth::is_root() { b" (root)\n" } else { b" (" });
+        if !auth::is_root() {
+            console_write(auth::username());
+            console_write(b")\n");
         }
     } else if command == b"su" {
         if auth::begin_root_login() {
@@ -968,6 +1621,7 @@ unsafe fn run_command() {
         }
     } else if command == b"logout" {
         auth::begin_login();
+        clear_history();
         console_write(b"\nLogged out.\n");
     } else if command == b"opfetch" {
         print_opfetch();
@@ -975,7 +1629,9 @@ unsafe fn run_command() {
         console_write(b"OpSYS is a tiny BIOS-booted x86_64 kernel written in Rust.\n");
         console_write(b"It uses paging, ring 3, syscalls, IDT exceptions and preemptive tasks.\n");
     } else if command == b"version" {
-        console_write(b"OpSYS 0.6.0 | x86_64 | Rust no_std\n");
+        console_write(b"OpSYS ");
+        console_write(version_text());
+        console_write(b" | x86_64 | Rust no_std\n");
     } else if command == b"uptime" {
         let ticks = TIMER_TICKS;
         let seconds = ticks / 100;
@@ -1016,23 +1672,34 @@ unsafe fn run_command() {
     } else if command == b"ui" {
         if graphics::active() {
             graphics::refresh(core::ptr::addr_of!((*console).cells));
-            console_write(
-                b"Redrew the VBE desktop. Click BLEUU on the taskbar for service status.\n",
-            );
+            console_write(b"Redrew the BleuuWM desktop. Use Super+1..3 for workspaces.\n");
         } else {
             console_write(b"Desktop is inactive. Run 'bleuu start desktop' after installing it.\n");
         }
+    } else if command == b"wm" {
+        console_write(b"BleuuWM | workspace ");
+        console_write_u64(wm::current_workspace() as u64 + 1);
+        console_write(b" | focused: ");
+        console_write(wm::focused_name());
+        console_write(b"\nSuper+1..3 workspace | Super+J/K focus | Super+M maximize\n");
+        console_write(b"Super+Q close | Super+Enter terminal | click taskbar to open apps\n");
     } else if command == b"desktop" || command == b"bleuu start desktop" {
-        if !auth::is_root() {
-            console_write(b"Root access required. Run 'su' first.\n");
-        } else if !bleuu::desktop_installed() {
+        if !bleuu::desktop_installed() {
             console_write(b"Desktop is not installed. Run 'bleuu install desktop'.\n");
         } else if graphics::activate(core::ptr::addr_of!((*console).cells)) {
-            console_write(b"Started the built-in VBE desktop. Type 'terminal' to return.\n");
+            console_write(b"Started BleuuWM. Use 'bleuu stop desktop' to leave the desktop.\n");
         } else {
             console_write(b"No usable VBE framebuffer is available.\n");
         }
-    } else if command == b"terminal" || command == b"bleuu stop desktop" {
+    } else if command == b"terminal" || command == b"window terminal" {
+        if graphics::active() {
+            wm::open_terminal();
+            graphics::refresh(core::ptr::addr_of!((*console).cells));
+            console_write(b"Terminal window focused.\n");
+        } else {
+            console_write(b"The terminal shell is already active.\n");
+        }
+    } else if command == b"bleuu stop desktop" {
         graphics::deactivate(core::ptr::addr_of!((*console).cells));
         console_write(b"Returned to terminal mode.\n");
     } else if command == b"mem" {
@@ -1053,6 +1720,42 @@ unsafe fn run_command() {
         console_clear();
     } else if command == b"color" {
         console_write(b"Colors: white, gray, red, green, yellow, blue, magenta, cyan, default\n");
+    } else if command == b"config" || command == b"config show" {
+        show_preferences();
+    } else if command == b"config lua" {
+        show_lua_config();
+    } else if command == b"config reset" {
+        reset_preferences();
+    } else if command.starts_with(b"config set color ") {
+        set_preference_color(&command[b"config set color ".len()..]);
+    } else if command == b"config set font bold" {
+        set_preference_font(true);
+    } else if command == b"config set font regular" {
+        set_preference_font(false);
+    } else if command.starts_with(b"config set background ") {
+        set_preference_background(&command[b"config set background ".len()..]);
+    } else if command == b"font" {
+        console_write(b"Framebuffer font: OpSYS Pixel ");
+        console_write(if graphics::bold_font() {
+            b"Bold\n"
+        } else {
+            b"Regular\n"
+        });
+        console_write(
+            b"Use 'font bold' or 'font regular'. VGA text mode uses its hardware font.\n",
+        );
+    } else if command == b"font bold" || command == b"font regular" {
+        let bold = command == b"font bold";
+        if graphics::set_bold_font(bold) {
+            graphics::refresh(core::ptr::addr_of!((*console).cells));
+            console_write(if bold {
+                b"Framebuffer font set to OpSYS Pixel Bold.\n"
+            } else {
+                b"Framebuffer font set to OpSYS Pixel Regular.\n"
+            });
+        } else {
+            console_write(b"The font option needs a VBE framebuffer.\n");
+        }
     } else if command.starts_with(b"color ") {
         let name = &command[6..];
         let attribute = match name {
@@ -1119,45 +1822,80 @@ unsafe fn run_command() {
                 }
             }
         }
-    } else if command == b"ls" {
-        fs::list(|line| console_write(line));
-    } else if command == b"cat README.TXT" || command == b"cat readme.txt" {
-        if let Some(bytes) = fs::read(b"README.TXT") {
-            console_write(bytes);
-        }
-    } else if command == b"cat NOTE" || command == b"cat note" {
-        let mut sector = [0u8; 512];
-        if let Some(bytes) = fs::read_note(&mut sector) {
-            console_write(bytes);
-            console_put_byte(b'\n');
+    } else if command == b"ls" || command.starts_with(b"ls ") {
+        let path = if command.len() > 2 {
+            &command[3..]
         } else {
-            console_write(b"NOTE is empty (or IDE disk unavailable).\n");
+            b""
+        };
+        if let Err(error) = vfs::VFS.list(path, &mut |line| console_write(line)) {
+            console_vfs_error(error);
         }
-    } else if command.starts_with(b"write NOTE ") || command.starts_with(b"write note ") {
-        if fs::write_note(&command[11..]) {
-            console_write(b"Saved NOTE to IDE disk.\n");
+    } else if command.starts_with(b"cat ") {
+        let path = &command[4..];
+        let mut output = [0u8; diskfs::MAX_FILE_SIZE];
+        match vfs::VFS.read_file(path, &mut output) {
+            Ok(length) => {
+                console_write(&output[..length]);
+                if length == 0 || output[length - 1] != b'\n' {
+                    console_put_byte(b'\n');
+                }
+            }
+            Err(error) => console_vfs_error(error),
+        }
+    } else if command.starts_with(b"write ") {
+        let remainder = &command[6..];
+        if let Some(separator) = remainder.iter().position(|byte| *byte == b' ') {
+            let path = &remainder[..separator];
+            let contents = &remainder[separator + 1..];
+            match vfs::VFS.write_file(path, contents) {
+                Ok(()) => console_write(b"File saved to HOME.\n"),
+                Err(error) => console_vfs_error(error),
+            }
         } else {
-            console_write(b"Could not save NOTE. Check the disk and note length.\n");
+            console_write(b"Usage: write <file> <text>\n");
+        }
+    } else if command.starts_with(b"mkdir ") {
+        match vfs::VFS.mkdir(&command[6..]) {
+            Ok(()) => console_write(b"Directory created in HOME.\n"),
+            Err(error) => console_vfs_error(error),
+        }
+    } else if command.starts_with(b"touch ") {
+        match vfs::VFS.touch(&command[6..]) {
+            Ok(()) => console_write(b"File created in HOME.\n"),
+            Err(error) => console_vfs_error(error),
         }
     } else if command == b"disk" {
-        if let Some(info) = ata::identify() {
-            console_write(b"IDE disk: ");
-            console_write(&info.model);
-            console_write(b" | LBA28 sectors: ");
-            console_write_u64(info.sectors as u64);
-            console_put_byte(b'\n');
-            console_write(b"Persistent HOME partition begins at LBA 4096.\n");
-        } else {
-            console_write(b"No ATA disk detected.\n");
+        match ata::identify() {
+            Ok(info) => {
+                console_write(b"IDE disk: ");
+                console_write(&info.model);
+                console_write(b" | LBA28 sectors: ");
+                console_write_u64(info.sectors as u64);
+                console_put_byte(b'\n');
+                match system::partition(partition::TYPE_HOME) {
+                    Ok(home) => {
+                        console_write(b"HOME partition begins at LBA ");
+                        console_write_u64(home.start_lba as u64);
+                        console_put_byte(b'\n');
+                    }
+                    Err(error) => {
+                        console_write(b"HOME partition unavailable: ");
+                        console_storage_error(error);
+                    }
+                }
+            }
+            Err(error) => {
+                console_write(b"Disk query failed: ");
+                console_storage_error(system::StorageError::Ata(error));
+            }
         }
     } else if command == b"partitions" {
         system::partitions(&mut |bytes| console_write(bytes), |value| {
             console_write_u64(value as u64)
         });
     } else if command == b"bleuu install desktop" {
-        if !auth::is_root() {
-            console_write(b"Root access required. Run 'su' first.\n");
-        } else if bleuu::install_desktop() {
+        if bleuu::install_desktop() {
             console_write(
                 b"Bleuu: desktop profile installed. Run 'bleuu start desktop' to launch it.\n",
             );
@@ -1165,18 +1903,12 @@ unsafe fn run_command() {
             console_write(b"Bleuu: could not save the desktop profile to SYSTEM.\n");
         }
     } else if command == b"bleuu remove desktop" {
-        if !auth::is_root() {
-            console_write(b"Root access required. Run 'su' first.\n");
-        } else if bleuu::remove_desktop() {
+        if bleuu::remove_desktop() {
             graphics::deactivate(core::ptr::addr_of!((*console).cells));
             console_write(b"Bleuu: desktop profile removed. HOME files were left untouched.\n");
         } else {
             console_write(b"Bleuu: desktop profile is not installed.\n");
         }
-    } else if (command.starts_with(b"bleuu install ") || command.starts_with(b"bleuu remove "))
-        && !auth::is_root()
-    {
-        console_write(b"Root access required. Run 'su' first.\n");
     } else if bleuu::execute(command, |bytes| console_write(bytes)) {
     } else if command == b"alloc" {
         let mut values = alloc::vec::Vec::new();
@@ -1199,6 +1931,192 @@ fn halt_forever() -> ! {
         unsafe {
             core::arch::asm!("cli; hlt", options(nomem, nostack));
         }
+    }
+}
+
+unsafe fn console_vfs_error(error: vfs::Error) {
+    if let vfs::Error::Storage(error) = error {
+        console_write(b"Storage error: ");
+        console_storage_error(error);
+        return;
+    }
+    console_write(match error {
+        vfs::Error::NotFound => b"No such file or directory.\n",
+        vfs::Error::ReadOnly => b"That built-in file is read-only.\n",
+        vfs::Error::NoSpace => b"HOME is full or the file is too large.\n",
+        vfs::Error::DeviceUnavailable => b"HOME disk is unavailable.\n",
+        vfs::Error::InvalidPath => b"Invalid path. Use letters, digits, '.', '_' and '-'.\n",
+        vfs::Error::AlreadyExists => b"That path already exists.\n",
+        vfs::Error::NotDirectory => b"A parent path is not a directory.\n",
+        vfs::Error::IsDirectory => b"That path is a directory.\n",
+        vfs::Error::Corrupt => b"HOME filesystem metadata or file checksum is corrupt.\n",
+        vfs::Error::PermissionDenied => {
+            b"Permission denied: this HOME entry belongs to another UID.\n"
+        }
+        vfs::Error::Storage(_) => b"Storage error.\n",
+    });
+}
+
+unsafe fn console_storage_error(error: system::StorageError) {
+    system::write_error(error, &mut |bytes| console_write(bytes), &mut |value| {
+        console_write_u64(value as u64)
+    });
+    console_put_byte(b'\n');
+}
+
+unsafe fn apply_session_preferences() {
+    match settings::load() {
+        Ok(preferences) => apply_preferences(preferences),
+        Err(error) => {
+            console_write(b"Saved shell settings could not be loaded: ");
+            console_vfs_error(error);
+        }
+    }
+}
+
+unsafe fn show_preferences() {
+    let preferences = match settings::load() {
+        Ok(preferences) => preferences,
+        Err(error) => {
+            console_vfs_error(error);
+            return;
+        }
+    };
+    console_write(b"Shell settings for UID ");
+    console_write_u64(auth::uid() as u64);
+    console_write(b"\ncolor: ");
+    console_write(color_name(preferences.color));
+    console_write(b"\nfont: ");
+    console_write(if preferences.bold_font {
+        b"bold\n"
+    } else {
+        b"regular\n"
+    });
+    console_write(b"background: ");
+    console_write(settings::background_name(preferences.background));
+    console_put_byte(b'\n');
+}
+
+unsafe fn show_lua_config() {
+    let mut source = [0u8; 256];
+    match settings::lua_config(&mut source) {
+        Ok(length) => console_write(&source[..length]),
+        Err(error) => console_vfs_error(error),
+    }
+}
+
+unsafe fn set_preference_color(name: &[u8]) {
+    let Some(color) = parse_color(name) else {
+        console_write(
+            b"Unknown color. Try: white, gray, red, green, yellow, blue, magenta, cyan, default.\n",
+        );
+        return;
+    };
+    let mut preferences = match settings::load() {
+        Ok(preferences) => preferences,
+        Err(error) => {
+            console_vfs_error(error);
+            return;
+        }
+    };
+    preferences.color = color;
+    if let Err(error) = settings::save(preferences) {
+        console_vfs_error(error);
+        return;
+    }
+    apply_preferences(preferences);
+    console_write(b"Text color saved in your HOME settings.\n");
+}
+
+unsafe fn set_preference_font(bold: bool) {
+    let mut preferences = match settings::load() {
+        Ok(preferences) => preferences,
+        Err(error) => {
+            console_vfs_error(error);
+            return;
+        }
+    };
+    preferences.bold_font = bold;
+    if let Err(error) = settings::save(preferences) {
+        console_vfs_error(error);
+        return;
+    }
+    apply_preferences(preferences);
+    console_write(if bold {
+        b"Bold font preference saved in your HOME settings.\n"
+    } else {
+        b"Regular font preference saved in your HOME settings.\n"
+    });
+}
+
+unsafe fn set_preference_background(name: &[u8]) {
+    if !bleuu::desktop_installed() {
+        console_write(b"Install the desktop first with 'bleuu install desktop'.\n");
+        return;
+    }
+    let Some(background) = settings::background_index(name) else {
+        console_write(b"Unknown background. Try: midnight, ocean, forest, sunset, slate, ember.\n");
+        return;
+    };
+    let mut preferences = match settings::load() {
+        Ok(preferences) => preferences,
+        Err(error) => {
+            console_vfs_error(error);
+            return;
+        }
+    };
+    preferences.background = background;
+    if let Err(error) = settings::save(preferences) {
+        console_vfs_error(error);
+        return;
+    }
+    apply_preferences(preferences);
+    console_write(b"Desktop background saved in your HOME Lua settings.\n");
+}
+
+unsafe fn reset_preferences() {
+    let preferences = settings::Preferences::DEFAULT;
+    if let Err(error) = settings::save(preferences) {
+        console_vfs_error(error);
+        return;
+    }
+    apply_preferences(preferences);
+    console_write(b"Your shell settings were reset to defaults.\n");
+}
+
+unsafe fn apply_preferences(preferences: settings::Preferences) {
+    let console = core::ptr::addr_of_mut!(CONSOLE);
+    (*console).attribute = preferences.color;
+    let _ = graphics::set_background(preferences.background);
+    if graphics::set_bold_font(preferences.bold_font) {
+        graphics::refresh(core::ptr::addr_of!((*console).cells));
+    }
+}
+
+fn parse_color(name: &[u8]) -> Option<u8> {
+    match name {
+        b"default" | b"white" => Some(0x0f),
+        b"gray" => Some(0x07),
+        b"red" => Some(0x0c),
+        b"green" => Some(0x0a),
+        b"yellow" => Some(0x0e),
+        b"blue" => Some(0x09),
+        b"magenta" => Some(0x0d),
+        b"cyan" => Some(0x0b),
+        _ => None,
+    }
+}
+
+fn color_name(attribute: u8) -> &'static [u8] {
+    match attribute {
+        0x07 => b"gray",
+        0x0c => b"red",
+        0x0a => b"green",
+        0x0e => b"yellow",
+        0x09 => b"blue",
+        0x0d => b"magenta",
+        0x0b => b"cyan",
+        _ => b"white",
     }
 }
 
